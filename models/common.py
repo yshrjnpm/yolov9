@@ -39,6 +39,38 @@ def autopad(k, p=None, d=1):  # kernel, padding, dilation
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
     return p
 
+class CBAM(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.mlp = nn.Sequential(
+            nn.Conv2d(channels, channels // reduction, 1, bias=False),
+            nn.ReLU(),
+            nn.Conv2d(channels // reduction, channels, 1, bias=False)
+        )
+
+        self.sigmoid = nn.Sigmoid()
+
+        self.spatial = nn.Sequential(
+            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Channel attention
+        avg = self.mlp(self.avg_pool(x))
+        max_ = self.mlp(self.max_pool(x))
+        x = x * self.sigmoid(avg + max_)
+
+        # Spatial attention
+        avg = torch.mean(x, dim=1, keepdim=True)
+        max_, _ = torch.max(x, dim=1, keepdim=True)
+        x = x * self.spatial(torch.cat([avg, max_], dim=1))
+
+        return x
 
 class Conv(nn.Module):
     # Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)
@@ -607,16 +639,21 @@ class RepNCSPELAN4(nn.Module):
         self.cv2 = nn.Sequential(RepNCSP(c3//2, c4, c5), Conv(c4, c4, 3, 1))
         self.cv3 = nn.Sequential(RepNCSP(c4, c4, c5), Conv(c4, c4, 3, 1))
         self.cv4 = Conv(c3+(2*c4), c2, 1, 1)
+        self.cbam = CBAM(c3 + 2*c4)
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, 1))
         y.extend((m(y[-1])) for m in [self.cv2, self.cv3])
-        return self.cv4(torch.cat(y, 1))
+        out = torch.cat(y, 1)
+        out = self.cbam(out)
+        return self.cv4(out)
 
     def forward_split(self, x):
         y = list(self.cv1(x).split((self.c, self.c), 1))
         y.extend(m(y[-1]) for m in [self.cv2, self.cv3])
-        return self.cv4(torch.cat(y, 1))
+        out = torch.cat(y, 1)
+        out = self.cbam(out)
+        return self.cv4(out)
 
 #################
 
@@ -1215,38 +1252,7 @@ class UConv(nn.Module):
 
     def forward(self, x):
         return self.up(self.cv2(self.cv1(x)))
-class CBAM(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super().__init__()
 
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
-
-        self.mlp = nn.Sequential(
-            nn.Conv2d(channels, channels // reduction, 1, bias=False),
-            nn.ReLU(),
-            nn.Conv2d(channels // reduction, channels, 1, bias=False)
-        )
-
-        self.sigmoid = nn.Sigmoid()
-
-        self.spatial = nn.Sequential(
-            nn.Conv2d(2, 1, kernel_size=7, padding=3, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        # Channel attention
-        avg = self.mlp(self.avg_pool(x))
-        max_ = self.mlp(self.max_pool(x))
-        x = x * self.sigmoid(avg + max_)
-
-        # Spatial attention
-        avg = torch.mean(x, dim=1, keepdim=True)
-        max_, _ = torch.max(x, dim=1, keepdim=True)
-        x = x * self.spatial(torch.cat([avg, max_], dim=1))
-
-        return x
 
 class Classify(nn.Module):
     # YOLO classification head, i.e. x(b,c1,20,20) to x(b,c2)
